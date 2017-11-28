@@ -41,7 +41,9 @@ blocking_get()
 
 '''
 run this script and send signal to the process as it blocks at socket.recv
+send signal to process
 
+signal(817, signal.SIGUSER1)
 
 on python2.7,it receive the signal and raise Interrupted
 ('receive sig %d', 30)
