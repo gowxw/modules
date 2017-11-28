@@ -54,7 +54,9 @@ socket.error: [Errno 4] Interrupted system call
 
 
 on python3.5,it receive the signal and continue socket.recv
-
+see cpython socketmodules.c
+If the socket function is interrupted by a signal (failed with EINTR): retry
+   the function, except if the signal handler raised an exception (PEP 475).
 
 '''
 
