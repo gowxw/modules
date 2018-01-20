@@ -1,0 +1,41 @@
+import socket
+from SocketServer import (TCPServer as TCP,
+     StreamRequestHandler as SRH)
+from time import ctime
+HOST = '127.0.0.1'
+PORT = 9999
+ADDR = (HOST,PORT)
+
+class MyRequestHandler(SRH):
+    def handle(self):
+        print '...connected from:', self.client_address
+        print self.request
+        print self.rfile,self.wfile## rfile和wfile的类型是 socket._fileobject
+        print self.rfile.read(3)
+
+
+class mytcp(TCP):
+    allow_reuse_address = 1
+
+tcpServ = mytcp(ADDR,MyRequestHandler)
+
+print tcpServ.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+
+
+print 'waiting for connection'
+tcpServ.serve_forever()
+
+以上程序是基本的tcp_server,以StreamRequestHandler作为处理请求的class，该class会基于request(socket_type)类 创建 fileobject,而fileobject 提供了read readline 等函数，这些函数是你指定读多少，就得读多少，读不够就会阻塞
+
+而如果把 BaseRequestHandler 作为处理请求的class，这个类不需要一定要读取足够的长度的，跟socket类似，读不够，可以返回
+
+class MyRequestHandler(SRH):
+    def handle(self):
+        print '...connected from:', self.client_address
+        print self.request.recv(100)
+##客户端发送多少，读到多少，就可以返回，request的类型是socket._socketobject,除非你在recv的时候置顶了要读取所有：
+              self.request.recv(100,socket.MSG_WAITALL)，也就是说这句话与 fileobject 的处理类似
+
+－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－
+BaseRequestHandler在python源码里，用的地方不多，在BaseHTTPServer中作为request 处理的类
+
