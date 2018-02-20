@@ -137,7 +137,7 @@ class apxPublisher(object):
         self._channel.basic_publish(self.EXCHANGE, self.ROUTING_KEY,
                                     msg,properties = None)
         self._message_number += 1
-        LOGGER.info('Published message # %i', self._message_number)
+        LOGGER.debug('Published message # %i', self._message_number)
         #self.schedule_next_message()
 
     def run(self):
@@ -189,5 +189,3 @@ class apxPublisher(object):
         if self._connection is not None:
             LOGGER.info('Closing connection')
             self._connection.close()
-
-
