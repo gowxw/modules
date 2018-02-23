@@ -1,6 +1,7 @@
 import functools
 import logging
 import pika
+import popmgmt_msg
 
 LOGGER = logging.getLogger("agent")
 
@@ -26,6 +27,7 @@ class apxConsumer(object):
         self._closing = False
         self._consumer_tag = None
         self._parameter = amqp_parameter
+        self._ready = False
 
     def connect(self):
         """This method connects to RabbitMQ, returning the connection handle.
@@ -204,6 +206,7 @@ class apxConsumer(object):
         LOGGER.info('Issuing consumer related RPC commands')
         self.add_on_cancel_callback()
         self._consumer_tag = self._channel.basic_consume(self.on_message,queue=self.QUEUE)
+        self._ready = True
 
     def add_on_cancel_callback(self):
         """Add a callback that will be invoked if RabbitMQ cancels the consumer
@@ -237,6 +240,9 @@ class apxConsumer(object):
         """
         LOGGER.debug('Received message # %s from %s: %s',
                     basic_deliver.delivery_tag, properties.app_id, body)
+
+        popmgmt_msg.recv_msg(body)
+
         self.acknowledge_message(basic_deliver.delivery_tag)
 
     def acknowledge_message(self, delivery_tag):

@@ -15,21 +15,33 @@ import signal
 import resource
 import atexit
 import traceback
+import socket
+import struct
+import select
 import redis
+import json
+import popmgmt_msg
+import psutil
 
-log = logging.getLogger("agent")
-hdl = logging.FileHandler("./pop_stats_log.log")
-fmt = logging.Formatter(fmt="[%(asctime)s %(threadName)s %(filename)s %(funcName)s %(lineno)d] %(message)s")
-hdl.setFormatter(fmt)
-log.addHandler(hdl)
-log.setLevel(logging.INFO)
+__version__ = '0.0.1'
 
-pool = redis.ConnectionPool(host='127.0.0.1', port=6379, db=0)
-redisconn = redis.Redis(connection_pool=pool)
-
+log = None
 publish_connection = None
 consumer_connection = None
+redisconn = None
 pid_dir = "./agent_pid"
+
+popid = "4"
+controllerid = "10"
+
+RTMGRP_LINK = 1
+NLMSG_NOOP = 1
+NLMSG_ERROR = 2
+RTM_NEWLINK = 16
+RTM_DELLINK = 17
+IFLA_IFNAME = 3
+IFF_RUNNING = 64
+
 
 class Daemonize(object):
     """
@@ -83,8 +95,6 @@ class Daemonize(object):
         os.remove(self.pid)
         sys.exit(0)
 
-    def cmds(self, signum, frame):
-        self.logger.warn("hahahaha %d %r",signum,type(frame))
 
     def start(self):
         """
@@ -225,8 +235,6 @@ class Daemonize(object):
         signal.signal(signal.SIGTERM, self.sigterm)
         atexit.register(self.exit)
 
-        signal.signal(signal.SIGUSR1, self.cmds)
-
         self.logger.warn("Starting popmgmt.")
 
         try:
@@ -238,27 +246,71 @@ class Daemonize(object):
 
 
 def send_entry():
-    publish_connection.run()
+    try:
+        publish_connection.run()
+    except Exception as e:
+        for line in traceback.format_exc().split("\n"):
+            log.error(line)
+        raise
 
 def recv_entry():
-    consumer_connection.run()
+    try:
+        consumer_connection.run()
+    except Exception as e:
+        for line in traceback.format_exc().split("\n"):
+            log.error(line)
+        raise
 
 def report_entry():
     while True:
         if publish_connection._connection:
             try:
-                log.debug("send msg")
-                msg = 'abcdefg' + str(publish_connection._message_number)
-                publish_connection._connection.add_timeout(0, functools.partial(publish_connection.publish_message,
-                                                                                msg))
+                send_sysinfo()
             except Exception as e:
                 log.warning('publish connection not ready2 %s', e)
                 pass
-            time.sleep(1)
+            time.sleep(9)
         else:
-            log.info('publish connection not ready1')
+            log.warning('publish connection not ready1')
             time.sleep(1)
 
+
+def send_login():
+    msg = popmgmt_msg.msg_head('login',popid,controllerid)
+    msg['params']['result'] = 'ok'
+
+    publish_connection._connection.add_timeout(0, functools.partial(publish_connection.publish_message,json.dumps(msg)))
+
+def send_link_state(interface_status):
+    msg = popmgmt_msg.msg_head('interface_status', popid, controllerid)
+    msg['params']['result'] = interface_status
+
+    publish_connection._connection.add_timeout(0,functools.partial(publish_connection.publish_message, json.dumps(msg)))
+
+def send_keepalive():
+    msg = popmgmt_msg.msg_head('keepalive', popid, controllerid)
+    msg['params']['popmgmt'] = __version__
+    publish_connection._connection.add_timeout(0,functools.partial(publish_connection.publish_message, json.dumps(msg)))
+
+def send_sysinfo():
+    msg = popmgmt_msg.msg_head('system_stats', popid, controllerid)
+    memres = psutil.virtual_memory()
+    diskres = psutil.disk_usage("/")
+    cpuusage = psutil.cpu_times_percent(interval=1, percpu=True)
+    msg['params']['memtotal'] = str(memres.total)
+    msg['params']['memused'] = str(memres.used)
+    msg['params']['disktotal'] = str(diskres.total)
+    msg['params']['diskused'] = str(diskres.used)
+
+    cpu_all = 0
+    cpu_num = 0
+
+    for x in cpuusage:
+        cpu_all += (100.0 - x.idle)
+        cpu_num += 1
+
+    msg['params']['cpu'] = [str(round(cpu_all / len(cpuusage), 1))] + [str(round(100-x.idle,1)) for x in cpuusage]
+    publish_connection._connection.add_timeout(0,functools.partial(publish_connection.publish_message, json.dumps(msg)))
 
 def start():
     global publish_connection
@@ -271,42 +323,135 @@ def start():
                                            connection_attempts=3,
                                            heartbeat=3600)
 
-    publish_connection = apxpublish.apxPublisher(parameters)
-    publish_connection.EXCHANGE = 'topic_to_edge'
-    publish_connection.ROUTING_KEY = 'edge.B6B761BFC9F5C2C4'
-
     consumer_connection = apxconsume.apxConsumer(parameters)
-    consumer_connection.EXCHANGE = 'topic_to_edge'
-    consumer_connection.ROUTING_KEY = 'edge.B6B761BFC9F5C2C4'
-    consumer_connection.QUEUE = 'queue_edge_B6B761BFC9F5C2C4'
+    consumer_connection.EXCHANGE = 'topic_to_pop'
+    consumer_connection.ROUTING_KEY = 'pop.' + popid
+    consumer_connection.QUEUE = 'queue_pop_' + popid
 
+    recv_thread = threading.Thread(target=recv_entry, name="consume")
+    recv_thread.daemon = True
+    recv_thread.start()
+
+    publish_connection = apxpublish.apxPublisher(parameters)
+    publish_connection.EXCHANGE = 'topic_to_orchestrator'
+    publish_connection.ROUTING_KEY = 'orchestrator.' + controllerid
 
     send_thread = threading.Thread(target=send_entry, name="publish")
     send_thread.daemon = True
     send_thread.start()
 
-    recv_thread = threading.Thread(target=recv_entry, name="consume")
-    recv_thread.daemon =True
-    recv_thread.start()
+    seng_login_time =None
+    while True:
+        if publish_connection._ready is True and consumer_connection._ready is True:
+            send_login()
+            seng_login_time = time.time()
+            break
+        else:
+            log.warning("wait for rabbitmq connection getting ready")
+            time.sleep(1)
+            continue
+
+    while True:
+        if popmgmt_msg.login_or_not is False:
+            if time.time() > (seng_login_time + 10):
+                send_login()
+                seng_login_time = time.time()
+            else:
+                time.sleep(1)
+        else:
+            break
+
+    log.warning("login ok, start to work")
 
     report_thread = threading.Thread(target=report_entry, name="report")
     report_thread.daemon = True
     report_thread.start()
 
+    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+    s.bind((os.getpid(), RTMGRP_LINK))
+    keepalive_time = 0
+
     while True:
+        res = select.select([s], [], [], 1)
+        if res[0]:
+            data = s.recv(1024)
+            msg_len, msg_type, flags, seq, pid = struct.unpack("=LHHLL", data[:16])
+
+            if msg_type == NLMSG_NOOP:
+                print "no-op"
+                continue
+            elif msg_type == NLMSG_ERROR:
+                print "error"
+                break
+
+            # We fundamentally only care about NEWLINK messages in this version.
+            if msg_type != RTM_NEWLINK and msg_type != RTM_DELLINK:
+                continue
+
+            data = data[16:]
+
+            family, _, if_type, index, flags, change = struct.unpack("=BBHiII", data[:16])
+
+            remaining = msg_len - 32
+            data = data[16:]
+
+            while remaining:
+                rta_len, rta_type = struct.unpack("=HH", data[:4])
+
+                # This check comes from RTA_OK, and terminates a string of routing
+                # attributes.
+                if rta_len < 4:
+                    break
+
+                rta_data = data[4:rta_len]
+
+                increment = (rta_len + 4 - 1) & ~(4 - 1)
+                data = data[increment:]
+                remaining -= increment
+                if rta_type == IFLA_IFNAME:
+                    if msg_type == RTM_NEWLINK:
+                        state_msg = "%s %s" % ((lambda s: "".join(i for i in s if 31 < ord(i) < 127))(rta_data), ("up" if (flags & IFF_RUNNING) else "down"))
+                        log.warning("add link %s",state_msg)
+                        send_link_state(state_msg)
+                    if msg_type == RTM_DELLINK:
+                        state_msg = "%s %s" % ((lambda s: "".join(i for i in s if 31 < ord(i) < 127))(rta_data), ("up" if (flags & IFF_RUNNING) else "down"))
+                        log.warning("del link %s", state_msg)
+                        send_link_state(state_msg)
+
         try:
-            res = redisconn.blpop("popmgmt_sig")
-            log.warning("get signal %s %s",res[0],res[1])
-            if res[1] == "open msg":
-                log.setLevel(logging.DEBUG)
-            if res[1] == "close msg":
-                log.setLevel(logging.INFO)
+            res = redisconn.blpop("popmgmt_sig",1)
+            if res is not None:
+                log.warning("get signal %s %s",res[0],res[1])
+                if res[1] == "open msg":
+                    log.setLevel(logging.DEBUG)
+                if res[1] == "close msg":
+                    log.setLevel(logging.INFO)
         except redis.RedisError as e:
             log.error("connect redis error %s",e)
             exit(1)
 
+        if time.time() > (keepalive_time + 30):
+            keepalive_time = time.time()
+            send_keepalive()
+
+
+
+def popmgmt_init():
+    global log
+    global redisconn
+
+    log = logging.getLogger("agent")
+    hdl = logging.FileHandler("./pop_stats_log.log")
+    fmt = logging.Formatter(fmt="[%(asctime)s %(threadName)s %(filename)s %(funcName)s %(lineno)d] %(message)s")
+    hdl.setFormatter(fmt)
+    log.addHandler(hdl)
+    log.setLevel(logging.INFO)
+
+    pool = redis.ConnectionPool(host='127.0.0.1', port=6379, db=0)
+    redisconn = redis.Redis(connection_pool=pool)
 
 if __name__ == '__main__':
+    popmgmt_init()
     if len(sys.argv) == 1:
         print 'usage'
         exit(1)

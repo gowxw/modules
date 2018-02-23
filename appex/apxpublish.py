@@ -29,6 +29,7 @@ class apxPublisher(object):
 
         self._stopping = False
         self._parameter = amqp_parameter
+        self._ready = False
 
     def connect(self):
         """This method connects to RabbitMQ, returning the connection handle.
@@ -103,6 +104,7 @@ class apxPublisher(object):
         """
         LOGGER.info('Adding channel close callback')
         self._channel.add_on_close_callback(self.on_channel_closed)
+        self._ready = True
 
     def on_channel_closed(self, channel, reply_code, reply_text):
         """Invoked by pika when RabbitMQ unexpectedly closes the channel.
@@ -131,13 +133,14 @@ class apxPublisher(object):
         class.
         """
         if self._channel is None or not self._channel.is_open:
+            LOGGER.warning('Publish connection not ready')
             return
 
 
         self._channel.basic_publish(self.EXCHANGE, self.ROUTING_KEY,
                                     msg,properties = None)
         self._message_number += 1
-        LOGGER.debug('Published message # %i', self._message_number)
+        LOGGER.debug('Published message # %i %s', self._message_number,msg)
         #self.schedule_next_message()
 
     def run(self):
