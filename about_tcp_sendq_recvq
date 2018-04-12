@@ -1,0 +1,105 @@
+客户端的地址是  10.1.4.111
+服务器端的地址是10.1.3.100
+
+客户端程序
+
+import time
+import socket
+
+
+serveraddr = ("10.1.3.100",9999)
+
+buf = "*"*16384
+
+client = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+client.setblocking(False)
+
+try:
+    client.connect(serveraddr)
+except socket.error as e:
+    print e
+
+
+
+while True:
+    try:
+        len = client.send(buf)
+        print len
+        time.sleep(1)
+    except socket.error as e:
+        time.sleep(1)
+        print e
+
+服务端程序
+
+import SocketServer
+import time
+class myhandle(SocketServer.BaseRequestHandler):
+    def handle(self):
+        while True:
+            time.sleep(1)
+            #data = self.request.recv(100)
+            #print data
+
+
+addr = ("10.1.3.100",9999)
+server = SocketServer.TCPServer(addr,myhandle)
+server.serve_forever()
+
+客户端一直发送data，服务端不接受data
+
+服务端产生的现象用
+netstat -antp | grep "9999" 观察，其Recv-Q 没有减少，一直在增长，表示内核接受的字节数，但是没有被应用程序取走，增长到一个数值后，不再增长，表示buffer已满
+
+同时观察客户端的 Send-Q，数值也在增长，增长到一个数值后不再增长，此时观察打印出来sendlen的数值
+在阻塞发送时，当Send-Q满后 最后会send会阻塞不返回
+在非阻塞发送时，当Send-Q满后 最后会send会发回并报错
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+16384
+656
+[Errno 11] Resource temporarily unavailable
+[Errno 11] Resource temporarily unavailable
+[Errno 11] Resource temporarily unavailable
+[Errno 11] Resource temporarily unavailable
+[Errno 11] Resource temporarily unavailable
+[Errno 11] Resource temporarily unavailable
+[Errno 11] Resource temporarily unavailable
+[Errno 11] Resource temporarily unavailable
+
+
+
+
+将server端recv的动作打开，再进行测试
+
+刚开始运行正常，server端的Recv-Q 和 client端的Send-Q 计数正常
+
+如果给服务端加一条drop规则
+iptables -N tcp_test
+iptables -t filter -I INPUT
+iptables -t filter -I tcp_test -s 10.1.4.111 -j DROP
+
+可以发现 client端的Send-Q 开始增长，是因为client端发出的tcp packet，不能到达server 端，
+也就无法得到server端的tcp ack，所以就一直堆积在缓存里。
+如果再次把 iptables -t filter -I tcp_test -s 10.1.4.111 -j DROP 这条规则去掉，可以发现
+过一会堆积在 client端 Send-Q缓存里的数据会无丢失的发送到server端，此时Send-Q又恢复正常
