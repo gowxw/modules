@@ -1,0 +1,128 @@
+rst报文产生的几种情况
+
+服务端(192.168.1.10)程序如下：
+
+import socket
+import SocketServer
+import time
+s = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+#s.setsockopt(socket.SO_REUSEADDR)
+s.bind(("192.168.1.10",9999))
+s.listen(10)
+c,addr = s.accept()
+print c,addr
+a = c.recv(4)
+
+c.close()
+
+time.sleep(1000)
+
+客户端(192.168.1.16)程序如下
+
+import time
+import socket
+
+
+serveraddr = ("192.168.1.10",9999)
+
+buf1 = "abcdeabced" #10个字节
+buf2 = "xyzdfdf" #7个字节
+buf3 = "exception eccour"   #16个字节
+client = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+#client.setblocking(False)
+
+try:
+    client.connect(serveraddr)
+except socket.error as e:
+    print e
+
+time.sleep(5)
+
+client.send(buf1)
+time.sleep(2)
+#client.send(buf2)
+#time.sleep(30)
+
+
+
+1)不运行服务端程序，直接运行客户端程序，此时因为服务端没有监听端口号
+  服务端会向客户端发送rst报文，抓包如下：
+
+02:30:45.583050 IP localhost.localdomain.51270 > 192.168.1.10.distinct: Flags [S], seq 2565966021, win 29200, options [mss 1460,sackOK,TS val 59911403 ecr 0,nop,wscale 7], length 0
+02:30:45.602384 IP 192.168.1.10.distinct > localhost.localdomain.51270: Flags [R.], seq 0, ack 2565966022, win 0, length 0
+
+
+2)运行服务端程序，服务端监听端口后，客户端连接服务端，并且发送buf1（10个字节），
+  服务端只接收四个字节,然后就关闭，此时并不会产生rst报文
+02:35:44.539682 IP localhost.localdomain.51272 > 192.168.1.10.distinct: Flags [S], seq 4214181726, win 29200, options [mss 1460,sackOK,TS val 60210360 ecr 0,nop,wscale 7], length 0
+02:35:44.544984 IP 192.168.1.10.distinct > localhost.localdomain.51272: Flags [S.], seq 51895860, ack 4214181727, win 65535, options [mss 1460,nop,wscale 5,nop,nop,TS val 850239607 ecr 60210360,sackOK,eol], length 0
+02:35:44.544997 IP localhost.localdomain.51272 > 192.168.1.10.distinct: Flags [.], ack 1, win 229, options [nop,nop,TS val 60210365 ecr 850239607], length 0
+02:35:44.547611 IP 192.168.1.10.distinct > localhost.localdomain.51272: Flags [.], ack 1, win 4117, options [nop,nop,TS val 850239610 ecr 60210365], length 0
+
+02:35:49.550375 IP localhost.localdomain.51272 > 192.168.1.10.distinct: Flags [P.], seq 1:11, ack 1, win 229, options [nop,nop,TS val 60215370 ecr 850239610], length 10
+02:35:49.758677 IP localhost.localdomain.51272 > 192.168.1.10.distinct: Flags [P.], seq 1:11, ack 1, win 229, options [nop,nop,TS val 60215579 ecr 850239610], length 10
+02:35:50.477653 IP localhost.localdomain.51272 > 192.168.1.10.distinct: Flags [P.], seq 1:11, ack 1, win 229, options [nop,nop,TS val 60216298 ecr 850239610], length 10
+02:35:50.898409 IP 192.168.1.10.distinct > localhost.localdomain.51272: Flags [.], ack 11, win 4117, options [nop,nop,TS val 850245846 ecr 60215370], length 0
+02:35:50.898660 IP 192.168.1.10.distinct > localhost.localdomain.51272: Flags [.], ack 11, win 4117, options [nop,nop,TS val 850245846 ecr 60215579,nop,nop,sack 1 {1:11}], length 0
+02:35:50.898825 IP 192.168.1.10.distinct > localhost.localdomain.51272: Flags [F.], seq 1, ack 11, win 4117, options [nop,nop,TS val 850245846 ecr 60215579], length 0
+02:35:50.899447 IP localhost.localdomain.51272 > 192.168.1.10.distinct: Flags [.], ack 2, win 229, options [nop,nop,TS val 60216720 ecr 850245846], length 0
+02:35:50.900361 IP 192.168.1.10.distinct > localhost.localdomain.51272: Flags [F.], seq 1, ack 11, win 4117, options [nop,nop,TS val 850245847 ecr 60216298,nop,nop,sack 1 {1:11}], length 0
+02:35:50.900391 IP localhost.localdomain.51272 > 192.168.1.10.distinct: Flags [.], ack 2, win 229, options [nop,nop,TS val 60216720 ecr 850245847,nop,nop,sack 1 {1:2}], length 0
+02:35:50.903482 IP 192.168.1.10.distinct > localhost.localdomain.51272: Flags [.], ack 11, win 4117, options [nop,nop,TS val 850245946 ecr 60216720], length 0
+
+3）如果客户端发送5000个字节，服务端接受4096个字节后关闭，服务端会发送rst报文
+
+02:39:21.332584 IP localhost.localdomain.51276 > 192.168.1.10.distinct: Flags [S], seq 4207486720, win 29200, options [mss 1460,sackOK,TS val 60427153 ecr 0,nop,wscale 7], length 0
+02:39:21.335318 IP 192.168.1.10.distinct > localhost.localdomain.51276: Flags [S.], seq 999525967, ack 4207486721, win 65535, options [mss 1460,nop,wscale 5,nop,nop,TS val 850455968 ecr 60427153,sackOK,eol], length 0
+02:39:21.335330 IP localhost.localdomain.51276 > 192.168.1.10.distinct: Flags [.], ack 1, win 229, options [nop,nop,TS val 60427155 ecr 850455968], length 0
+02:39:21.337571 IP 192.168.1.10.distinct > localhost.localdomain.51276: Flags [.], ack 1, win 4117, options [nop,nop,TS val 850455970 ecr 60427155], length 0
+02:39:26.340678 IP localhost.localdomain.51276 > 192.168.1.10.distinct: Flags [.], seq 1:1449, ack 1, win 229, options [nop,nop,TS val 60432161 ecr 850455970], length 1448
+02:39:26.340715 IP localhost.localdomain.51276 > 192.168.1.10.distinct: Flags [.], seq 1449:2897, ack 1, win 229, options [nop,nop,TS val 60432161 ecr 850455970], length 1448
+02:39:26.340726 IP localhost.localdomain.51276 > 192.168.1.10.distinct: Flags [.], seq 2897:4345, ack 1, win 229, options [nop,nop,TS val 60432161 ecr 850455970], length 1448
+02:39:26.342307 IP localhost.localdomain.51276 > 192.168.1.10.distinct: Flags [P.], seq 4345:5001, ack 1, win 229, options [nop,nop,TS val 60432162 ecr 850455970], length 656
+02:39:26.347275 IP 192.168.1.10.distinct > localhost.localdomain.51276: Flags [F.], seq 1, ack 1449, win 4096, options [nop,nop,TS val 850460972 ecr 60432161], length 0
+02:39:26.347453 IP localhost.localdomain.51276 > 192.168.1.10.distinct: Flags [.], ack 2, win 229, options [nop,nop,TS val 60432168 ecr 850460972], length 0
+02:39:26.352267 IP 192.168.1.10.distinct > localhost.localdomain.51276: Flags [R], seq 999525968, win 0, length 0
+02:39:26.352339 IP 192.168.1.10.distinct > localhost.localdomain.51276: Flags [R], seq 999525968, win 0, length 0
+02:39:26.356488 IP localhost.localdomain.51276 > 192.168.1.10.distinct: Flags [P.], seq 4345:5001, ack 2, win 229, options [nop,nop,TS val 60432177 ecr 850460972], length 656
+02:39:26.359644 IP 192.168.1.10.distinct > localhost.localdomain.51276: Flags [R], seq 999525968, win 0, length 0
+02:39:26.374060 IP 192.168.1.10.distinct > localhost.localdomain.51276: Flags [R], seq 999525969, win 0, length 0
+02:39:26.376314 IP 192.168.1.10.distinct > localhost.localdomain.51276: Flags [R], seq 999525969, win 0, length 0
+
+比较2）3）的不同，分析是尽管客户端都是只调用一次send，但是第二次的报文经过了ip分片，在操作系统层面也是
+多次发送，等服务端的socket关闭后，客户端的任何一次发送，都会促使服务端的tcp协议栈发送rst报文
+
+4）客户端掉用两次send，第一次send(buf1),而服务端受到buf1后关闭socket，客户端再发送buf2。客户端第二次发送报文后，收到了服务端的rst报文
+02:51:25.338936 IP localhost.localdomain.51288 > 192.168.1.10.distinct: Flags [S], seq 1642525010, win 29200, options [mss 1460,sackOK,TS val 61151159 ecr 0,nop,wscale 7], length 0
+02:51:25.341590 IP 192.168.1.10.distinct > localhost.localdomain.51288: Flags [S.], seq 2515906479, ack 1642525011, win 65535, options [mss 1460,nop,wscale 5,nop,nop,TS val 851178598 ecr 61151159,sackOK,eol], length 0
+02:51:25.341617 IP localhost.localdomain.51288 > 192.168.1.10.distinct: Flags [.], ack 1, win 229, options [nop,nop,TS val 61151162 ecr 851178598], length 0
+02:51:25.346008 IP 192.168.1.10.distinct > localhost.localdomain.51288: Flags [.], ack 1, win 4117, options [nop,nop,TS val 851178602 ecr 61151162], length 0
+
+02:51:30.346899 IP localhost.localdomain.51288 > 192.168.1.10.distinct: Flags [P.], seq 1:11, ack 1, win 229, options [nop,nop,TS val 61156167 ecr 851178602], length 10
+02:51:30.550672 IP localhost.localdomain.51288 > 192.168.1.10.distinct: Flags [P.], seq 1:11, ack 1, win 229, options [nop,nop,TS val 61156371 ecr 851178602], length 10
+02:51:30.569122 IP 192.168.1.10.distinct > localhost.localdomain.51288: Flags [.], ack 11, win 4117, options [nop,nop,TS val 851183809 ecr 61156371], length 0
+02:51:30.569686 IP 192.168.1.10.distinct > localhost.localdomain.51288: Flags [F.], seq 1, ack 11, win 4117, options [nop,nop,TS val 851183809 ecr 61156371], length 0
+02:51:30.570456 IP localhost.localdomain.51288 > 192.168.1.10.distinct: Flags [.], ack 2, win 229, options [nop,nop,TS val 61156391 ecr 851183809], length 0
+02:51:30.590429 IP 192.168.1.10.distinct > localhost.localdomain.51288: Flags [.], ack 11, win 4117, options [nop,nop,TS val 851183828 ecr 61156391], length 0
+02:51:32.349252 IP localhost.localdomain.51288 > 192.168.1.10.distinct: Flags [P.], seq 11:18, ack 2, win 229, options [nop,nop,TS val 61158169 ecr 851183828], length 7
+02:51:32.758563 IP localhost.localdomain.51288 > 192.168.1.10.distinct: Flags [P.], seq 11:18, ack 2, win 229, options [nop,nop,TS val 61158579 ecr 851183828], length 7
+02:51:32.765610 IP 192.168.1.10.distinct > localhost.localdomain.51288: Flags [R], seq 2515906481, win 0, length 0
+02:51:32.783348 IP 192.168.1.10.distinct > localhost.localdomain.51288: Flags [R], seq 2515906481, win 0, length 0   
+
+
+5）客户端在收到rst报文后，再次发送，调用send(buf3),会产生异常如下
+   Traceback (most recent call last):
+  File "s1.py", line 26, in <module>
+    client.send(buf3)
+socket.error: [Errno 32] Broken pipe
+   
+   因此在很多c语言服务器程序中，都有signal(SIGPIPE, SIG_IGN) 这样的设置
+
+
+6）通常socket close函数发送FIN报文， 通过设置SO_LINGER参数，可以改变close函数的行为，发送rst报文
+
+
+
+
+参考：
+https://blog.csdn.net/yusiguyuan/article/details/22885667
