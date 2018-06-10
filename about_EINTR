@@ -1,0 +1,40 @@
+import socket
+import signal
+import errno
+import select
+
+def handler(signum, frame):
+    print 'Signal handler called with signal', signum
+    
+
+signal.signal(signal.SIGUSR1,handler)
+
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.bind(("10.1.3.101",9999))
+
+s.listen(5)
+
+
+
+while True:
+    try:
+        s.accept()
+    except socket.error as e:
+        if e[0] == errno.EINTR:
+            print 'continue'
+'''
+rset = [s]
+while True:
+    try:
+        res = select.select(rset, [], [])
+    except select.error as e:
+        if e[0] == errno.EINTR:
+            print 'contine'
+'''
+
+操作：
+当程序阻塞在accept、select、read、write时，给该程序发送一个USR1 信号，程序
+会先执行signal的注册函数，注册函数返回后，调用被阻塞的函数（accept、select）等
+然后阻塞函数返回-1，并且errno设置为EINTR
+
+ref:  http://www.xuebuyuan.com/1470645.html
