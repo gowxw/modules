@@ -32,9 +32,10 @@ while True:
             print 'contine'
 '''
 
-操作：
-当程序阻塞在accept、select、read、write时，给该程序发送一个USR1 信号，程序
+
+
+(1)当程序阻塞在accept、select、read、write时，给该程序发送一个USR1 信号，程序
 会先执行signal的注册函数，注册函数返回后，调用被阻塞的函数（accept、select）等
 然后阻塞函数返回-1，并且errno设置为EINTR
-
-ref:  http://www.xuebuyuan.com/1470645.html
+(2)如果不注册signal函数，程序之间退出
+(3)关于进程的interuptable 和 uninteruptable :  http://www.xuebuyuan.com/1470645.html
