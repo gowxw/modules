@@ -1,3 +1,4 @@
+server端程序如下：
 import socket
 import signal
 import errno
@@ -40,6 +41,7 @@ while True:
 (2)如果不注册signal函数，程序之间退出
 (3)关于进程的interuptable 和 uninteruptable :  http://www.xuebuyuan.com/1470645.html
 (4)针对connect 验证EINTR
+    connect 端程序如下
     import socket
     import time
     import signal
