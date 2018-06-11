@@ -39,3 +39,30 @@ while True:
 然后阻塞函数返回-1，并且errno设置为EINTR
 (2)如果不注册signal函数，程序之间退出
 (3)关于进程的interuptable 和 uninteruptable :  http://www.xuebuyuan.com/1470645.html
+(4)针对connect 验证EINTR
+    import socket
+    import time
+    import signal
+    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+
+    def handler(signum, frame):
+        print 'Signal handler called with signal', signum
+
+
+    signal.signal(signal.SIGUSR1,handler)
+
+    try:
+        c =s.connect(("10.1.3.101",9999))
+        time.sleep(10)
+    except socket.error as e:
+        print e
+ 
+   connect 的时候产生EINTR不好捕捉，因为connect是建立tcp三次握手，这个时间很快，不太容易
+   在connect的时候给程序发送一个USR1信号，如果server端不开启监听的端口,客户端又会报出
+   “Connection refused”的错误，因此可以这样触发，在server端上加一条iptable配置
+   iptables -t filter -D OUTPUT -p tcp --sport 9999 -j DROP
+   这样server端收到connect的syn报文后，回复ack，但是ack被drop，这样客户端就阻塞在connect
+   此时给客户端发送一个USR1 信号，就出现了:
+   Signal handler called with signal 10
+   [Errno 4] Interrupted system call
+   发送信号的时机也不能隔的时间太长，否则connect会产生timeout的错误，关于connect超时，会单写一篇小文章
