@@ -1,0 +1,999 @@
+mq client连接mq server的过程：
+1）首先建立tcp三次握手
+2）然后进行amqp协议层面的协商
+
+这两步过程走完后，就可以进行消息收发，同时还有amqp heartbeat报文在双方两端产生。
+如果网络质量不好，如果有一段时间heartbeat收发不正常，会产生missed heartbeats from client
+mq client感知到，并进行重连
+
+遇到问题的aws主机，完成了第一步三次握手成功后，mq server 上有 {handshake_timeout,frame_header} 的日志
+然后将该条tcp连接reset，然而在客户端这条连接还存在。
+
+而第二步的协商没有通过，因此无法通过协议层面的心跳检测，所以无法心跳超时进行重连。
+这时候设置tcp 层面的keepalive，即可解决这个问题
+
+_para = pika.ConnectionParameters(host=_addr[0],
+
+                                  port=_addr[1],
+
+                                  credentials=credentials,
+
+                                  socket_timeout=2,
+
+                                  connection_attempts=3,
+
+                                  heartbeat=25,
+
+                                  tcp_options={"TCP_KEEPIDLE":15,"TCP_KEEPCNT":3,"TCP_KEEPINTVL":5})
+
+增加tcp_options 参数
+
+
+
+这样的场景在网络好的情况下难以复现，可以借助tcpkill工具
+命令如下：
+在mq server 端执行：tcpkill -i enp3s0 src port 5672
+这个命令可以模拟发出tcp reset的包，这样mq server的连接断了，而mq client的连接还存在，
+这样就可以复现出来上述的问题。
+
+
+完整的测试代码
+
+#!/usr/bin/env python
+import pika
+import logging
+import functools
+import threading
+import traceback
+import time
+import os
+import sys
+import fcntl
+import commands
+import resource
+import atexit
+import grp
+import pwd
+import signal
+import redis
+import json
+
+
+log = logging.getLogger("agent")
+#hdl = logging.FileHandler("/var/log/cpeagent.log")
+hdl = logging.StreamHandler()
+fmt = logging.Formatter(fmt="[%(asctime)s pid:%(processName)s-%(process)d %(threadName)s %(filename)s line:%(lineno)d] %(message)s")
+hdl.setFormatter(fmt)
+log.addHandler(hdl)
+log.setLevel(logging.INFO)
+
+#pid_dir = "/var/run/cpeagent.pid"
+cpeagent_conf_path = "/etc/cpeagent/cpeagent.conf"
+__version__ = '0.0.20'
+
+orchestratorid = 0
+cpeid = 0
+custmoerid = 0
+
+publish_connection = None
+consumer_connection = None
+rabbitmq_user = None
+rabbitmq_pswd = None
+mq_addr = list()
+redisconn = None
+
+def print_usage():
+    print "cpeagent usage:"
+    print "        [cpeagent start]            :start cpeagent"
+    print "        [cpeagent stop]             :stop cpeagent"
+    print "        [cpeagent status]           :show cpeagent running status"
+    print "        [cpeagent open msg]         :open detail log"
+    print "        [cpeagent close msg]        :close detail log"
+    print "        [cpeagent -v]               :show version"
+
+
+def recv_msg(body):
+    log.info("receive msg: %r",body)
+    redisconn.rpush("mq_to_cpeagent",body)
+
+
+class Daemonize(object):
+    """
+    Daemonize object.
+    Object constructor expects three arguments.
+    :param app: contains the application name which will be sent to syslog.
+    :param pid: path to the pidfile.
+    :param action: your custom function which will be executed after daemonization.
+    :param keep_fds: optional list of fds which should not be closed.
+    :param auto_close_fds: optional parameter to not close opened fds.
+    :param privileged_action: action that will be executed before drop privileges if user or
+                              group parameter is provided.
+                              If you want to transfer anything from privileged_action to action, such as
+                              opened privileged file descriptor, you should return it from
+                              privileged_action function and catch it inside action function.
+    :param user: drop privileges to this user if provided.
+    :param group: drop privileges to this group if provided.
+    :param verbose: send debug messages to logger if provided.
+    :param logger: use this logger object instead of creating new one, if provided.
+    :param foreground: stay in foreground; do not fork (for debugging)
+    :param chdir: change working directory if provided or /
+    """
+    def __init__(self, pid, action,logger,
+                 keep_fds=None, auto_close_fds=True, privileged_action=None,
+                 user=None, group=None, verbose=False,
+                 foreground=False, chdir="/"):
+        self.pid = os.path.abspath(pid)
+        self.action = action
+        self.keep_fds = keep_fds or []
+        self.privileged_action = privileged_action or (lambda: ())
+        self.user = user
+        self.group = group
+        self.logger = logger
+        self.verbose = verbose
+        self.auto_close_fds = auto_close_fds
+        self.foreground = foreground
+        self.chdir = chdir
+
+    def sigterm(self, signum, frame):
+        """
+        These actions will be done after SIGTERM.
+        """
+        self.logger.warn("Caught signal %s. Stopping cpeagent." % signum)
+        sys.exit(0)
+
+    def exit(self):
+        """
+        Cleanup pid file at exit.
+        """
+        self.logger.warn("Stopping cpeagent.")
+        os.remove(self.pid)
+        sys.exit(0)
+
+
+    def start(self):
+        """
+        Start daemonization process.
+        """
+        # If pidfile already exists, we should read pid from there; to overwrite it, if locking
+        # will fail, because locking attempt somehow purges the file contents.
+        if os.path.isfile(self.pid):
+            with open(self.pid, "r") as old_pidfile:
+                old_pid = old_pidfile.read()
+        # Create a lockfile so that only one instance of this daemon is running at any time.
+        try:
+            lockfile = open(self.pid, "w")
+        except IOError:
+            print("Unable to create the pidfile.")
+            sys.exit(1)
+        try:
+            # Try to get an exclusive lock on the file. This will fail if another process has the file
+            # locked.
+            fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            print("cpeagent is running")
+            self.logger.error("cpeagent is running.")
+            # We need to overwrite the pidfile if we got here.
+            with open(self.pid, "w") as pidfile:
+                pidfile.write(old_pid)
+            sys.exit(1)
+
+        # skip fork if foreground is specified
+        if not self.foreground:
+            # Fork, creating a new process for the child.
+            try:
+                process_id = os.fork()
+            except OSError as e:
+                self.logger.error("Unable to fork, errno: {0}".format(e.errno))
+                sys.exit(1)
+            if process_id != 0:
+                # This is the parent process. Exit without cleanup,
+                # see https://github.com/thesharp/daemonize/issues/46
+                os._exit(0)
+            # This is the child process. Continue.
+
+            # Stop listening for signals that the parent process receives.
+            # This is done by getting a new process id.
+            # setpgrp() is an alternative to setsid().
+            # setsid puts the process in a new parent group and detaches its controlling terminal.
+            process_id = os.setsid()
+
+            if process_id == -1:
+                # Uh oh, there was a problem.
+                sys.exit(1)
+            # Add lockfile to self.keep_fds.
+            self.keep_fds.append(lockfile.fileno())
+            # Close all file descriptors, except the ones mentioned in self.keep_fds.
+            devnull = "/dev/null"
+            if hasattr(os, "devnull"):
+                # Python has set os.devnull on this system, use it instead as it might be different
+                # than /dev/null.
+                devnull = os.devnull
+
+            if self.auto_close_fds:
+                for fd in range(3, resource.getrlimit(resource.RLIMIT_NOFILE)[0]):
+                    if fd not in self.keep_fds:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+            devnull_fd = os.open(devnull, os.O_RDWR)
+            os.dup2(devnull_fd, 0)
+            os.dup2(devnull_fd, 1)
+            os.dup2(devnull_fd, 2)
+            os.close(devnull_fd)
+
+
+        # Set umask to default to safe file permissions when running as a root daemon. 027 is an
+        # octal number which we are typing as 0o27 for Python3 compatibility.
+        os.umask(0o27)
+
+        # Change to a known directory. If this isn't done, starting a daemon in a subdirectory that
+        # needs to be deleted results in "directory busy" errors.
+        os.chdir(self.chdir)
+
+        # Execute privileged action
+        privileged_action_result = self.privileged_action()
+        if not privileged_action_result:
+            privileged_action_result = []
+
+        # Change owner of pid file, it's required because pid file will be removed at exit.
+        uid, gid = -1, -1
+
+        if self.group:
+            try:
+                gid = grp.getgrnam(self.group).gr_gid
+            except KeyError:
+                self.logger.error("Group {0} not found".format(self.group))
+                sys.exit(1)
+
+        if self.user:
+            try:
+                uid = pwd.getpwnam(self.user).pw_uid
+            except KeyError:
+                self.logger.error("User {0} not found.".format(self.user))
+                sys.exit(1)
+
+        if uid != -1 or gid != -1:
+            os.chown(self.pid, uid, gid)
+
+        # Change gid
+        if self.group:
+            try:
+                os.setgid(gid)
+            except OSError:
+                self.logger.error("Unable to change gid.")
+                sys.exit(1)
+
+        # Change uid
+        if self.user:
+            try:
+                uid = pwd.getpwnam(self.user).pw_uid
+            except KeyError:
+                self.logger.error("User {0} not found.".format(self.user))
+                sys.exit(1)
+            try:
+                os.setuid(uid)
+            except OSError:
+                self.logger.error("Unable to change uid.")
+                sys.exit(1)
+
+        try:
+            lockfile.write("%s" % (os.getpid()))
+            lockfile.flush()
+        except IOError:
+            self.logger.error("Unable to write pid to the pidfile.")
+            print("Unable to write pid to the pidfile.")
+            sys.exit(1)
+
+        # Set custom action on SIGTERM.
+        signal.signal(signal.SIGTERM, self.sigterm)
+        atexit.register(self.exit)
+
+        self.logger.warn("Starting cpeagent.")
+
+        try:
+            self.action(*privileged_action_result)
+        except Exception:
+            for line in traceback.format_exc().split("\n"):
+                self.logger.error(line)
+
+class apxConsumer(object):
+    """This is an example consumer that will handle unexpected interactions
+    with RabbitMQ such as channel and connection closures.
+    If RabbitMQ closes the connection, it will reopen it. You should
+    look at the output, as there are limited reasons why the connection may
+    be closed, which usually are tied to permission related issues or
+    socket timeouts.
+    If the channel is closed, it will indicate a problem with one of the
+    commands that were issued and that should surface in the output as well.
+    """
+
+    def __init__(self, amqp_parameter_list):
+        """Create a new instance of the consumer class, passing in the AMQP
+        URL used to connect to RabbitMQ.
+        :param str amqp_url: The AMQP url to connect with
+        """
+        self._connection = None
+        self._channel = None
+        self._closing = False
+        self._consumer_tag = None
+        self._parameter = amqp_parameter_list
+        self._nowpara = None
+        self._ready = False
+
+    def connect(self):
+        """This method connects to RabbitMQ, returning the connection handle.
+        When the connection is established, the on_connection_open method
+        will be invoked by pika.
+        :rtype: pika.SelectConnection
+        """
+
+        self._nowpara = self._parameter.pop(0)
+        self._parameter.append(self._nowpara)
+
+        log.info('Connecting to %s:%d', self._nowpara.host, self._nowpara.port)
+
+        return pika.SelectConnection(self._nowpara,
+                                     on_open_callback=self.on_connection_open,
+                                     on_open_error_callback=self.on_connection_open_error,
+                                     on_close_callback=self.on_connection_closed,
+                                     stop_ioloop_on_close=False)
+
+    def on_connection_open(self, unused_connection):
+        """This method is called by pika once the connection to RabbitMQ has
+        been established. It passes the handle to the connection object in
+        case we need it, but in this case, we'll just mark it unused.
+        :type unused_connection: pika.SelectConnection
+        """
+        log.info('Connection opened')
+        self.open_channel()
+
+    def on_connection_open_error(self, unused_connection, err):
+        """This method is called by pika if the connection to RabbitMQ
+        can't be established.
+        :type unused_connection: pika.SelectConnection
+        :type err: str
+        """
+        log.info('Connection open failed: %s', err)
+        #self._connection.add_timeout(3, self.reconnect)
+        self._connection.add_timeout(3, self._connection.ioloop.stop)
+
+    def on_connection_closed(self, connection, reply_code, reply_text):
+        """This method is invoked by pika when the connection to RabbitMQ is
+        closed unexpectedly. Since it is unexpected, we will reconnect to
+        RabbitMQ if it disconnects.
+        :param pika.connection.Connection connection: The closed connection obj
+        :param int reply_code: The server provided reply_code if given
+        :param str reply_text: The server provided reply_text if given
+        """
+        self._channel = None
+        if self._closing:
+            self._connection.ioloop.stop()
+        else:
+            log.warning('Connection closed,reconnect to %s:%d', self._nowpara.host, self._nowpara.port)
+            #self._connection.add_timeout(3, self.reconnect)
+            self._connection.add_timeout(1, self._connection.ioloop.stop)
+
+    def reconnect(self):
+        """Will be invoked by the IOLoop timer if the connection is
+        closed. See the on_connection_closed method.
+        """
+        # This is the old connection IOLoop instance, stop its ioloop
+        self._connection.ioloop.stop()
+
+        if not self._closing:
+
+            # Create a new connection
+            self._connection = self.connect()
+
+            # There is now a new connection, needs a new ioloop to run
+            self._connection.ioloop.start()
+
+    def open_channel(self):
+        """Open a new channel with RabbitMQ by issuing the Channel.Open RPC
+        command. When RabbitMQ responds that the channel is open, the
+        on_channel_open callback will be invoked by pika.
+        """
+        log.info('Creating a new channel')
+        self._connection.channel(on_open_callback=self.on_channel_open)
+
+    def on_channel_open(self, channel):
+        """This method is invoked by pika when the channel has been opened.
+        The channel object is passed in so we can make use of it.
+        Since the channel is now open, we'll declare the exchange to use.
+        :param pika.channel.Channel channel: The channel object
+        """
+        log.info('Channel opened')
+        self._channel = channel
+        self.add_on_channel_close_callback()
+        #self.setup_exchange(self.EXCHANGE)
+        self.setup_queue(self.QUEUE)
+
+    def add_on_channel_close_callback(self):
+        """This method tells pika to call the on_channel_closed method if
+        RabbitMQ unexpectedly closes the channel.
+        """
+        log.info('Adding channel close callback')
+        self._channel.add_on_close_callback(self.on_channel_closed)
+
+    def on_channel_closed(self, channel, reply_code, reply_text):
+        """Invoked by pika when RabbitMQ unexpectedly closes the channel.
+        Channels are usually closed if you attempt to do something that
+        violates the protocol, such as re-declare an exchange or queue with
+        different parameters. In this case, we'll close the connection
+        to shutdown the object.
+        :param pika.channel.Channel: The closed channel
+        :param int reply_code: The numeric reason the channel was closed
+        :param str reply_text: The text reason the channel was closed
+        """
+        log.warning('Channel %i was closed: (%s) %s',
+                        channel, reply_code, reply_text)
+        self._ready = False
+        redisconn.hset("cpeagent_conn_status", "consume", 0)
+        self._connection.close()
+
+    def setup_exchange(self, exchange_name):
+        """Setup the exchange on RabbitMQ by invoking the Exchange.Declare RPC
+        command. When it is complete, the on_exchange_declareok method will
+        be invoked by pika.
+        :param str|unicode exchange_name: The name of the exchange to declare
+        """
+        log.info('Declaring exchange: %s', exchange_name)
+        # Note: using functools.partial is not required, it is demonstrating
+        # how arbitrary data can be passed to the callback when it is called
+        cb = functools.partial(self.on_exchange_declareok, userdata=exchange_name)
+        self._channel.exchange_declare(exchange=exchange_name,
+                                       exchange_type=self.EXCHANGE_TYPE,
+                                       callback=cb)
+
+    def on_exchange_declareok(self, unused_frame, userdata):
+        """Invoked by pika when RabbitMQ has finished the Exchange.Declare RPC
+        command.
+        :param pika.Frame.Method unused_frame: Exchange.DeclareOk response frame
+        :param str|unicode userdata: Extra user data (exchange name)
+        """
+        log.info('Exchange declared: %s', userdata)
+        self.setup_queue(self.QUEUE)
+
+    def setup_queue(self, queue_name):
+        """Setup the queue on RabbitMQ by invoking the Queue.Declare RPC
+        command. When it is complete, the on_queue_declareok method will
+        be invoked by pika.
+        :param str|unicode queue_name: The name of the queue to declare.
+        """
+        log.info('Declaring queue %s', queue_name)
+        cb = functools.partial(self.on_queue_declareok,
+                               userdata=queue_name)
+        args = dict()
+        args["x-max-length"] = 10
+        self._channel.queue_declare(queue=queue_name, durable=False, callback=cb,auto_delete=True,arguments=None)
+
+    def on_queue_declareok(self, method_frame, userdata):
+        """Method invoked by pika when the Queue.Declare RPC call made in
+        setup_queue has completed. In this method we will bind the queue
+        and exchange together with the routing key by issuing the Queue.Bind
+        RPC command. When this command is complete, the on_bindok method will
+        be invoked by pika.
+        :param pika.frame.Method method_frame: The Queue.DeclareOk frame
+        :param str|unicode userdata: Extra user data (queue name)
+        """
+        queue_name = userdata
+        log.info('Binding %s to %s with %s',
+                    self.EXCHANGE, queue_name, self.ROUTING_KEY)
+        cb = functools.partial(self.on_bindok,
+                               userdata=queue_name)
+        self._channel.queue_bind(queue=queue_name,
+                                 exchange=self.EXCHANGE,
+                                 routing_key=self.ROUTING_KEY,
+                                 callback=cb)
+
+    def on_bindok(self, unused_frame, userdata):
+        """Invoked by pika when the Queue.Bind method has completed. At this
+        point we will start consuming messages by calling start_consuming
+        which will invoke the needed RPC commands to start the process.
+        :param pika.frame.Method unused_frame: The Queue.BindOk response frame
+        :param str|unicode userdata: Extra user data (queue name)
+        """
+        log.info('Queue bound: %s', userdata)
+        self.start_consuming()
+
+    def start_consuming(self):
+        """This method sets up the consumer by first calling
+        add_on_cancel_callback so that the object is notified if RabbitMQ
+        cancels the consumer. It then issues the Basic.Consume RPC command
+        which returns the consumer tag that is used to uniquely identify the
+        consumer with RabbitMQ. We keep the value to use it when we want to
+        cancel consuming. The on_message method is passed in as a callback pika
+        will invoke when a message is fully received.
+        """
+        log.info('Issuing consumer related RPC commands')
+        self.add_on_cancel_callback()
+        self._consumer_tag = self._channel.basic_consume(self.on_message,queue=self.QUEUE)
+        self._ready = True
+        redisconn.hset("cpeagent_conn_status", "consume", 1)
+
+    def add_on_cancel_callback(self):
+        """Add a callback that will be invoked if RabbitMQ cancels the consumer
+        for some reason. If RabbitMQ does cancel the consumer,
+        on_consumer_cancelled will be invoked by pika.
+        """
+        log.info('Adding consumer cancellation callback')
+        self._channel.add_on_cancel_callback(self.on_consumer_cancelled)
+
+    def on_consumer_cancelled(self, method_frame):
+        """Invoked by pika when RabbitMQ sends a Basic.Cancel for a consumer
+        receiving messages.
+        :param pika.frame.Method method_frame: The Basic.Cancel frame
+        """
+        log.info('Consumer was cancelled remotely, shutting down: %r',
+                    method_frame)
+        if self._channel:
+            self._channel.close()
+
+    def on_message(self, unused_channel, basic_deliver, properties, body):
+        """Invoked by pika when a message is delivered from RabbitMQ. The
+        channel is passed for your convenience. The basic_deliver object that
+        is passed in carries the exchange, routing key, delivery tag and
+        a redelivered flag for the message. The properties passed in is an
+        instance of BasicProperties with the message properties and the body
+        is the message that was sent.
+        :param pika.channel.Channel unused_channel: The channel object
+        :param pika.Spec.Basic.Deliver: basic_deliver method
+        :param pika.Spec.BasicProperties: properties
+        :param str|unicode body: The message body
+        """
+        log.debug('Received message # %s from %s: %s',
+                    basic_deliver.delivery_tag, properties.app_id, body)
+
+        recv_msg(body)
+
+        self.acknowledge_message(basic_deliver.delivery_tag)
+
+    def acknowledge_message(self, delivery_tag):
+        """Acknowledge the message delivery from RabbitMQ by sending a
+        Basic.Ack RPC method for the delivery tag.
+        :param int delivery_tag: The delivery tag from the Basic.Deliver frame
+        """
+        log.info('Acknowledging message %s', delivery_tag)
+        self._channel.basic_ack(delivery_tag)
+
+    def stop_consuming(self):
+        """Tell RabbitMQ that you would like to stop consuming by sending the
+        Basic.Cancel RPC command.
+        """
+        if self._channel:
+            log.debug('Sending a Basic.Cancel RPC command to RabbitMQ')
+            cb = functools.partial(self.on_cancelok,
+                                   userdata=self._consumer_tag)
+            self._channel.basic_cancel(consumer_tag=self._consumer_tag,
+                                       callback=cb)
+
+    def on_cancelok(self, unused_frame, userdata):
+        """This method is invoked by pika when RabbitMQ acknowledges the
+        cancellation of a consumer. At this point we will close the channel.
+        This will invoke the on_channel_closed method once the channel has been
+        closed, which will in-turn close the connection.
+        :param pika.frame.Method unused_frame: The Basic.CancelOk frame
+        :param str|unicode userdata: Extra user data (consumer tag)
+        """
+        log.info('RabbitMQ acknowledged the cancellation of the consumer: %s', userdata)
+        self.close_channel()
+
+    def close_channel(self):
+        """Call to close the channel with RabbitMQ cleanly by issuing the
+        Channel.Close RPC command.
+        """
+        log.info('Closing the channel')
+        self._channel.close()
+
+    def run(self):
+        """Run the example consumer by connecting to RabbitMQ and then
+        starting the IOLoop to block and allow the SelectConnection to operate.
+        """
+        #self._connection = self.connect()
+        #self._connection.ioloop.start()
+
+        while not self._closing:
+            self._connection = None
+            self._message_number = 0
+
+            try:
+                self._connection = self.connect()
+                log.info("---%s---",self._connection)
+                log.info("consume start")
+                #self._connection.ioloop._poller._MAX_POLL_TIMEOUT = 0.5
+                #LOGGER.warning("%d", self._connection.ioloop._poller._MAX_POLL_TIMEOUT)
+                self._connection.ioloop.start()
+                log.info("---%s---", self._connection)
+                log.info("consume end")
+            except KeyboardInterrupt:
+                self.stop()
+                if (self._connection is not None and
+                        not self._connection.is_closed):
+                    # Finish closing
+                    self._connection.ioloop.start()
+
+
+    def stop(self):
+        """Cleanly shutdown the connection to RabbitMQ by stopping the consumer
+        with RabbitMQ. When RabbitMQ confirms the cancellation, on_cancelok
+        will be invoked by pika, which will then closing the channel and
+        connection. The IOLoop is started again because this method is invoked
+        when CTRL-C is pressed raising a KeyboardInterrupt exception. This
+        exception stops the IOLoop which needs to be running for pika to
+        communicate with RabbitMQ. All of the commands issued prior to starting
+        the IOLoop will be buffered but not processed.
+        """
+        log.info('Stopping')
+        self._closing = True
+        self.stop_consuming()
+        self._connection.ioloop.start()
+        log.info('Stopped')
+
+    def close_connection(self):
+        """This method closes the connection to RabbitMQ."""
+        log.info('Closing connection')
+        self._connection.close()
+
+
+class apxPublisher(object):
+    """This is an example publisher that will handle unexpected interactions
+    with RabbitMQ such as channel and connection closures.
+    If RabbitMQ closes the connection, it will reopen it. You should
+    look at the output, as there are limited reasons why the connection may
+    be closed, which usually are tied to permission related issues or
+    socket timeouts.
+    It uses delivery confirmations and illustrates one way to keep track of
+    messages that have been sent and if they've been confirmed by RabbitMQ.
+    """
+
+    def __init__(self, amqp_parameter_list):
+        """Setup the example publisher object, passing in the URL we will use
+        to connect to RabbitMQ.
+        :param str amqp_url: The URL for connecting to RabbitMQ
+        """
+        self._connection = None
+        self._channel = None
+        self._message_number = None
+
+        self._stopping = False
+        self._parameter = amqp_parameter_list
+        self._nowpara = None
+        self._ready = False
+
+    def connect(self):
+        """This method connects to RabbitMQ, returning the connection handle.
+        When the connection is established, the on_connection_open method
+        will be invoked by pika. If you want the reconnection to work, make
+        sure you set stop_ioloop_on_close to False, which is not the default
+        behavior of this adapter.
+        :rtype: pika.SelectConnection
+        """
+        self._nowpara = self._parameter.pop(0)
+        self._parameter.append(self._nowpara)
+
+        log.info('Connecting to %s:%d', self._nowpara.host, self._nowpara.port)
+
+        return pika.SelectConnection(self._nowpara,
+                                     on_open_callback=self.on_connection_open,
+                                     on_open_error_callback=self.on_connection_open_error,
+                                     on_close_callback=self.on_connection_closed,
+                                     stop_ioloop_on_close=False)
+
+    def on_connection_open(self, unused_connection):
+        """This method is called by pika once the connection to RabbitMQ has
+        been established. It passes the handle to the connection object in
+        case we need it, but in this case, we'll just mark it unused.
+        :type unused_connection: pika.SelectConnection
+        """
+        log.info('Connection opened')
+        self.open_channel()
+
+    def on_connection_open_error(self, unused_connection, err):
+        """This method is called by pika if the connection to RabbitMQ
+        can't be established.
+        :type unused_connection: pika.SelectConnection
+        :type err: str
+        """
+        log.info('Connection open failed: %s', err)
+        self._connection.add_timeout(3, self._connection.ioloop.stop)
+
+    def on_connection_closed(self, connection, reply_code, reply_text):
+        """This method is invoked by pika when the connection to RabbitMQ is
+        closed unexpectedly. Since it is unexpected, we will reconnect to
+        RabbitMQ if it disconnects.
+        :param pika.connection.Connection connection: The closed connection obj
+        :param int reply_code: The server provided reply_code if given
+        :param str reply_text: The server provided reply_text if given
+        """
+        self._channel = None
+        if self._stopping:
+            self._connection.ioloop.stop()
+        else:
+            log.info('Connection closed,reconnect to %s:%d', self._nowpara.host, self._nowpara.port)
+            self._connection.add_timeout(1, self._connection.ioloop.stop)
+
+    def open_channel(self):
+        """This method will open a new channel with RabbitMQ by issuing the
+        Channel.Open RPC command. When RabbitMQ confirms the channel is open
+        by sending the Channel.OpenOK RPC reply, the on_channel_open method
+        will be invoked.
+        """
+        log.info('Creating a new channel')
+        self._connection.channel(on_open_callback=self.on_channel_open)
+
+    def on_channel_open(self, channel):
+        """This method is invoked by pika when the channel has been opened.
+        The channel object is passed in so we can make use of it.
+        Since the channel is now open, we'll declare the exchange to use.
+        :param pika.channel.Channel channel: The channel object
+        """
+        log.info('Channel opened')
+        self._channel = channel
+        self.add_on_channel_close_callback()
+
+    def add_on_channel_close_callback(self):
+        """This method tells pika to call the on_channel_closed method if
+        RabbitMQ unexpectedly closes the channel.
+        """
+        log.info('Adding channel close callback')
+        self._channel.add_on_close_callback(self.on_channel_closed)
+        self._ready = True
+        redisconn.hset("cpeagent_conn_status","publish",1)
+
+    def on_channel_closed(self, channel, reply_code, reply_text):
+        """Invoked by pika when RabbitMQ unexpectedly closes the channel.
+        Channels are usually closed if you attempt to do something that
+        violates the protocol, such as re-declare an exchange or queue with
+        different parameters. In this case, we'll close the connection
+        to shutdown the object.
+        :param pika.channel.Channel channel: The closed channel
+        :param int reply_code: The numeric reason the channel was closed
+        :param str reply_text: The text reason the channel was closed
+        """
+        log.warning('Channel was closed: (%s) %s', reply_code, reply_text)
+        self._channel = None
+        self._ready = False
+        redisconn.hset("cpeagent_conn_status", "publish", 0)
+
+        if not self._stopping:
+            self._connection.close()
+
+    def publish_message(self,exchange,msg):
+        """If the class is not stopping, publish a message to RabbitMQ,
+        appending a list of deliveries with the message number that was sent.
+        This list will be used to check for delivery confirmations in the
+        on_delivery_confirmations method.
+        Once the message has been sent, schedule another message to be sent.
+        The main reason I put scheduling in was just so you can get a good idea
+        of how the process is flowing by slowing down and speeding up the
+        delivery intervals by changing the PUBLISH_INTERVAL constant in the
+        class.
+        """
+        if self._channel is None or not self._channel.is_open:
+            log.warning('Publish connection not ready')
+            return
+
+        try:
+            self._channel.basic_publish(exchange, self.ROUTING_KEY,
+                                    msg,properties = None)
+        except pika.exceptions.AMQPError as e:
+            log.debug('exception %r', e)
+
+        if exchange == "topic_to_orchestrator":
+            log.info('Published message # %i %s', self._message_number,msg)
+        if exchange == "fanout_to_orchestrator":
+            log.debug('Published message # %i %s', self._message_number, msg)
+        self._message_number += 1
+        #self.schedule_next_message()
+
+    def run(self):
+        """Run the example code by connecting and then starting the IOLoop.
+        """
+        while not self._stopping:
+            self._connection = None
+            self._message_number = 0
+
+            try:
+                self._connection = self.connect()
+                log.info("---%s---",self._connection)
+                log.info("publish start")
+                self._connection.ioloop._poller._MAX_POLL_TIMEOUT = 0.5
+                #LOGGER.warning("%d", self._connection.ioloop._poller._MAX_POLL_TIMEOUT)
+                self._connection.ioloop.start()
+                log.info("---%s---", self._connection)
+                log.info("publish end")
+            except KeyboardInterrupt:
+                self.stop()
+                if (self._connection is not None and
+                        not self._connection.is_closed):
+                    # Finish closing
+                    self._connection.ioloop.start()
+
+        log.info('Stopped')
+
+    def stop(self):
+        """Stop the example by closing the channel and connection. We
+        set a flag here so that we stop scheduling new messages to be
+        published. The IOLoop is started because this method is
+        invoked by the Try/Catch below when KeyboardInterrupt is caught.
+        Starting the IOLoop again will allow the publisher to cleanly
+        disconnect from RabbitMQ.
+        """
+        log.info('Stopping')
+        self._stopping = True
+        self.close_channel()
+        self.close_connection()
+
+    def close_channel(self):
+        """Invoke this command to close the channel with RabbitMQ by sending
+        the Channel.Close RPC command.
+        """
+        if self._channel is not None:
+            log.info('Closing the channel')
+            self._channel.close()
+
+    def close_connection(self):
+        """This method closes the connection to RabbitMQ."""
+        if self._connection is not None:
+            log.info('Closing connection')
+            self._connection.close()
+
+
+def send_entry():
+
+    try:
+        publish_connection.run()
+    except Exception as e:
+        for line in traceback.format_exc().split("\n"):
+            log.error(line)
+        raise
+
+
+def recv_entry():
+    try:
+        consumer_connection.run()
+    except Exception as e:
+        for line in traceback.format_exc().split("\n"):
+            log.error(line)
+        raise
+
+
+
+def cmd_exec(cmd):
+    log.warning(cmd)
+    return os.system(cmd)
+
+def start():
+    global mq_addr
+    global orchestratorid
+    global cpeid
+    global custmoerid
+    global consumer_connection
+    global publish_connection
+    global redisconn
+    global rabbitmq_user
+    global rabbitmq_pswd
+    '''
+    with open(cpeagent_conf_path, 'r') as f:
+        for line in f:
+            confs = line.split('=')
+            if confs[0] == 'rabbitmqaddr':
+                _addrs = confs[1].strip()
+            if confs[0] == 'orchestratorid':
+                orchestratorid = confs[1].strip()
+            if confs[0] == 'cpeid':
+                cpeid = confs[1].strip()
+            if confs[0] == 'customerid':
+                custmoerid = confs[1].strip()
+            if confs[0] == 'rabbitmquser':
+                rabbitmq_user = confs[1].strip()
+            if confs[0] == 'rabbitmqpassword':
+                rabbitmq_pswd = confs[1].strip()
+    '''
+    _addrs="10.1.3.101:5672"
+    orchestratorid = '2'
+    cpeid = '10000'
+    custmoerid='20000'
+    rabbitmq_user='admin'
+    rabbitmq_pswd='admin'
+
+    try:
+        addrs = _addrs.split(',')
+        for _addr in addrs:
+            mq_addr.append((_addr.strip().split(':')[0], _addr.strip().split(':')[1]))
+
+    except Exception as e:
+        log.error("config file %s error",cpeagent_conf_path)
+        sys.exit(1)
+
+    if rabbitmq_user == None:
+        log.error("config file %s error", cpeagent_conf_path)
+        sys.exit(1)
+
+    if rabbitmq_pswd == None:
+        log.error("config file %s error", cpeagent_conf_path)
+        sys.exit(1)
+
+    pool = redis.ConnectionPool(host='127.0.0.1', port=6379, db=0)
+    redisconn = redis.Redis(connection_pool=pool)
+
+    redisconn.delete("cpeagent_to_mq_stat")
+    redisconn.delete("cpeagent_to_mq_config")
+    redisconn.delete("mq_to_cpeagent")
+    redisconn.delete("cpeagent_sig")
+    redisconn.hset("cpeagent_conn_status","publish", 0)
+    redisconn.hset("cpeagent_conn_status","consume", 0)
+
+    #fuse_check()
+
+    #os.system("cpeagent-sub start")
+
+
+    credentials = pika.PlainCredentials(rabbitmq_user, rabbitmq_pswd)
+    parameters = list()
+    for _addr in mq_addr:
+        _para = pika.ConnectionParameters(host=_addr[0],
+                                  port=_addr[1],
+                                  credentials=credentials,
+                                  socket_timeout=2,
+                                  connection_attempts=3,
+                                  heartbeat=25,
+                                  tcp_options={"TCP_KEEPIDLE":15,"TCP_KEEPCNT":3,"TCP_KEEPINTVL":5})
+        parameters.append(_para)
+
+    consumer_connection = apxConsumer(parameters)
+    consumer_connection.EXCHANGE = 'topic_to_edge'
+    consumer_connection.ROUTING_KEY = 'edge.' + custmoerid + '.' + cpeid
+    consumer_connection.QUEUE = 'queue_edge_' + custmoerid + '_' + cpeid
+
+    recv_thread = threading.Thread(target=recv_entry, name="consume")
+    recv_thread.daemon = True
+    recv_thread.start()
+
+    publish_connection = apxPublisher(parameters)
+    #publish_connection.EXCHANGE = 'topic_to_orchestrator'
+    publish_connection.ROUTING_KEY = 'orchestrator.' + orchestratorid
+    send_thread = threading.Thread(target=send_entry, name="publish")
+    send_thread.daemon = True
+    send_thread.start()
+
+    group_msg = dict()
+    group_msg['action'] = "lw_flow_report"
+    group_msg['from'] = cpeid
+    group_msg['customer'] = custmoerid
+    group_msg['to'] = orchestratorid
+    group_msg['sender'] = "edge"
+    group_msg['transactionId'] = 0
+    group_msg['params'] = dict()
+    group_msg['params']['stat'] = list()
+    group_msg_sendtime = time.time()
+
+    while True:
+        try:
+            if publish_connection._ready == True and consumer_connection._ready == True:
+                time.sleep(10)
+                #consumer_connection._connection.close()
+
+            else:
+                time.sleep(1)
+                log.debug("rabbitmq connection is not ready")
+        except AttributeError:
+            log.debug("rabbitmq connection is not ready")
+            time.sleep(1)
+
+
+start()
+
+
+
+
+
+
+
+
+
+
+
+
+
