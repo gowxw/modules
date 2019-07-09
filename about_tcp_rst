@@ -122,6 +122,10 @@ socket.error: [Errno 32] Broken pipe
 6）通常socket close函数发送FIN报文， 通过设置SO_LINGER参数，可以改变close函数的行为，发送rst报文
 
 
+7)recv 队列里还有数据没有接受完，但是执行了close()函数，此时向对端发送reset。
+  http://cs.ecs.baylor.edu/~donahoo/practical/CSockets/TCPRST.pdf
+
+
 
 
 参考：
