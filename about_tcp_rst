@@ -124,6 +124,9 @@ socket.error: [Errno 32] Broken pipe
 
 7)recv 队列里还有数据没有接受完，但是执行了close()函数，此时向对端发送reset。
   http://cs.ecs.baylor.edu/~donahoo/practical/CSockets/TCPRST.pdf
+  一种说法如下：https://www.itdks.com/Home/Course/detail?id=6007 
+  linux bsd windows都会出现，如果在kernel的socket有数据没有读取完，就把socket关闭，操作系统认为这是一中bug，因此发送rst（尽管tcp的rfc没有这样的明确规定）
+   
 
 
 
