@@ -53,9 +53,8 @@ print time.time()
 print "ready to send"
 sock.sendall(data + "\n")
 print "send finish"
-# Receive data from the server and shut down
-#received = sock.recv(1024)
-res = select.select([sock], [], [sock], 1000)
+
+res = select.select([sock], [], [sock], 1000)    # select 不会报错，只会返回sock可读，然后读的时候报错
 print res
 print time.time()
 
@@ -71,7 +70,7 @@ iptables -t mangle -I PREROUTING -p tcp -s $client_ip -j DROP
  ETIMOEOUT 发送的其他情况：
  设置tcp_keepalive，客户端代码
  
- import socket
+import socket
 import sys
 import time
 import select
@@ -93,15 +92,9 @@ print sock
 time.sleep(30)
 print time.time()
 print "ready to send"
-sock.send(data + "\n") # sleep 30秒后 send 由于之前已经发送了rst， 此时会报 ETIMOEOUT
+sock.send(data + "\n") # sleep 30秒后 send 由于之前已经发送了rst， 此时会报 ETIMOEOUT，异常退出
 print "send finish"
-# Receive data from the server and shut down
-#received = sock.recv(1024)
-res = select.select([sock], [], [sock], 1000)
-print res
-print time.time()
 
-res[0][0].recv(1024)
  
  
  
