@@ -1,0 +1,67 @@
+ETIMOEOUT 发生情况有两种
+1：connect超时
+  阻塞调用connect时， 三次握手，客户端发送syn，没有收到ack，发送n次后，connect返回ETIMOEOUT。
+  发送的次数n 由/proc/sys/net/ipv4/tcp_syn_retries 决定
+  
+ 2: recv
+   tcp三次握手完成后，如果一端发出了数据，而另一段没有ack（例如加了iptables drop）
+   发送端的send是可以成功返回的，因为发送到本机内核后就可以返回，
+   send返回后，调用recv。
+   如果另一端没有ack，在发送端会一直重传，知道放弃，然后内核会返回ETIMOEOUT 被recv捕获到
+   
+   重传的次数由  /proc/sys/net/ipv4/tcp_retries1 /proc/sys/net/ipv4/tcp_retries2 决定
+  
+
+server端程序
+
+import socket
+HOST = ''
+PORT = 20010
+ADDR = (HOST,PORT)
+import struct
+
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+
+s.bind(ADDR)
+s.listen(5)
+while True:
+    cs,caddr=s.accept()
+    print cs
+    buf = cs.recv(1024)
+    print buf
+
+
+客户端程序
+
+import socket
+import sys
+import time
+import select
+HOST, PORT = "49.232.150.36", 20010
+data = 'abce\n123'
+
+# Create a socket (SOCK_STREAM means a TCP socket)
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+
+# Connect to server and send data
+sock.connect((HOST, PORT))
+print sock
+time.sleep(20)
+print time.time()
+print "ready to send"
+sock.sendall(data + "\n")
+print "send finish"
+# Receive data from the server and shut down
+#received = sock.recv(1024)
+res = select.select([sock], [], [sock], 1000)
+print res
+print time.time()
+
+res[0][0].recv(1024)
+
+
+server端加iptables
+iptables -t mangle -I PREROUTING -p tcp -s $client_ip -j DROP
+ 
